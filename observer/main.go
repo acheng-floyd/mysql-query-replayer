@@ -17,14 +17,13 @@ import (
 )
 
 const (
-    ChannelCapacity = 100000      // 通道容量
-    BatchSize       = 2000        // pipeline每批发送条数
+    ChannelCapacity = 100000
+    BatchSize       = 2000
     BatchInterval   = 5 * time.Millisecond
 )
 
 var (
     debug      bool
-    cpuRate    int
     name       string
     device      string
     snapshotLen int
@@ -60,16 +59,13 @@ func parseOptions() {
     flag.IntVar(&packetCount, "c", -1, "Limit processing packets count (only enable when -debug is also specified)")
     flag.StringVar(&name, "name", "", "process name which is used as prefix of redis key")
 
-    // gopacket
     flag.StringVar(&device, "d", "en0", "device name to capture.")
     flag.IntVar(&snapshotLen, "s", 1024, "snapshot length for gopacket")
     flag.BoolVar(&promiscuous, "pr", false, "promiscuous for gopacket")
 
-    // MySQL
     flag.StringVar(&ignoreHostStr, "ih", "localhost", "ignore mysql hosts, specify only one ip address")
     flag.IntVar(&mPort, "mP", 3306, "mysql port")
 
-    // Redis
     flag.StringVar(&rHost, "rh", "localhost", "redis host")
     flag.IntVar(&rPort, "rP", 6379, "redis port")
     flag.StringVar(&rPassword, "rp", "", "redis password")
@@ -124,9 +120,15 @@ func isIgnoreHosts(ip string, ignoreHosts []string) bool {
 }
 
 func makeOneLine(q string) string {
-    q = strings.ReplaceAll(q, "\"", "'",)
+    q = strings.ReplaceAll(q, "\"", "'")
     q = strings.ReplaceAll(q, "\n", " ")
     return q
+}
+
+// 只允许 select 语句通过
+func isSelectQuery(q string) bool {
+    q = strings.TrimSpace(q)
+    return strings.HasPrefix(strings.ToLower(q), "select")
 }
 
 func sendQuery(packet gopacket.Packet) {
@@ -142,21 +144,20 @@ func sendQuery(packet gopacket.Packet) {
         return
     }
 
-    key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
-    capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
-    val := ""
-
     if pInfo.mysqlPacket[0].GetCommandType() == mp.COM_QUERY {
         cmd := pInfo.mysqlPacket[0].(mp.ComQuery)
         q := makeOneLine(cmd.Query)
-        val = "Q;" + capturedTime + ";" + q
-    } else {
-        return
-    }
-    select {
-    case redisCmdChan <- [2]string{key, val}:
-    default:
-        fmt.Println("[Warning] Redis command channel is full, dropping query")
+        if !isSelectQuery(q) {
+            return // 非select直接丢弃
+        }
+        key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
+        capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
+        val := "Q;" + capturedTime + ";" + q
+        select {
+        case redisCmdChan <- [2]string{key, val}:
+        default:
+            fmt.Println("[Warning] Redis command channel is full, dropping query")
+        }
     }
 }
 
