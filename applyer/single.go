@@ -46,13 +46,11 @@ func (a *singleApplyer) start() {
 					fmt.Println(ips[1] + " is specified as ignoring host")
 					continue
 				}
-				if !ignoreConnectionLimit {
-					if hostCnt <= a.cpuLimit {
-						a.hostProgress.Store(k, "0")
-						hostCnt += 1
-					} else {
-						fmt.Println("Too many hosts, ignore " + k)
-					}
+                if ignoreConnectionLimit || hostCnt <= a.cpuLimit {
+				    a.hostProgress.Store(k, "0")
+		            hostCnt += 1
+				} else {
+					fmt.Println("Too many hosts, ignore " + k)
 				}
 			}
 		}
@@ -89,6 +87,8 @@ func (a *singleApplyer) retrieveLoop() {
 			}
 			l := len(queries)
 			if l < 1 {
+                // 如果 key 已经空了，从 hostProgress 删除，不再消费
+                a.hostProgress.Delete(k)
 				continue
 			}
 			r = rpool.Get()
@@ -122,63 +122,61 @@ func (a *singleApplyer) retrieveLoop() {
 }
 
 func (a *singleApplyer) applyLoop() {
-	mysqlHost := mUser + ":" + mPassword + "@tcp(" + mHost + ":" + strconv.Itoa(mPort) + ")/" + mdb + "?loc=Local&parseTime=true"
-	if mSocket != "" {
-		mysqlHost = mUser + ":" + mPassword + "@unix(" + mSocket + ")/" + mdb + "?loc=Local&parseTime=true"
-	}
+    mysqlHost := mUser + ":" + mPassword + "@tcp(" + mHost + ":" + strconv.Itoa(mPort) + ")/" + mdb + "?loc=Local&parseTime=true"
+    if mSocket != "" {
+        mysqlHost = mUser + ":" + mPassword + "@unix(" + mSocket + ")/" + mdb + "?loc=Local&parseTime=true"
+    }
 
-	db, err := sql.Open("mysql", mysqlHost)
-	if err != nil {
-		fmt.Println("Connection to MySQL fail.")
-	}
-	defer db.Close()
-	var l, ll int
+    db, err := sql.Open("mysql", mysqlHost)
+    if err != nil {
+        fmt.Println("Connection to MySQL fail.", err)
+        return
+    }
+    defer db.Close()
 
-	for {
-		a.m.Lock()
-		ll = len(a.q)
-		a.m.Unlock()
-		if ll == 0 {
-			continue
-		}
-		a.m.Lock()
-		queries := make([]commandData, ll)
-		l = copy(queries, a.q)
-		a.q = []commandData{}
-		a.m.Unlock()
-		if timeSensitive && timeDiff == 0 {
-			n := time.Now()
-			if err != nil {
-				panic(err)
-			}
-			timeDiff = int(n.UnixNano()) - queries[0].capturedTime*1000
-		}
-		// fmt.Println("applyLoop m.Unlock()")
-		for i := 0; i < l; i++ {
-			// send query to mysql
-			if err != nil {
-				panic(err)
-			}
+    var (
+        concurrency = 64 // 并发数，可调整
+        workerChan  = make(chan commandData, 1000)
+        wg          sync.WaitGroup
+    )
 
-			now := int(time.Now().UnixNano())
-			sleepTime := queries[i].capturedTime*1000 + timeDiff - now
-			if timeSensitive && sleepTime > 0 {
-				time.Sleep(time.Duration(sleepTime) * time.Nanosecond)
-				i -= 1
-				continue
-			}
+    // 启动多个goroutine并行执行SQL
+    for i := 0; i < concurrency; i++ {
+        wg.Add(1)
+        go func(workerID int) {
+            defer wg.Done()
+            for cmd := range workerChan {
+                if cmd.ctype == "Q" {
+                    if _, err := db.Exec(cmd.query); err != nil {
+                        fmt.Printf("[Worker %d][ERROR] mysql exec failed: %v\n", workerID, err)
+                    }
+                }
+            }
+        }(i)
+    }
 
-			if queries[i].ctype == "Q" { // simple query
-				_, err := db.Exec(queries[i].query)
-				if err != nil {
-					fmt.Println(err)
-					continue
-				}
-			} else if queries[i].ctype == "P" {
-				// Prepare prepared_statement
-			} else if queries[i].ctype == "E" {
-				// Execute prepared_statement
-			}
-		}
-	}
+    for {
+        a.m.Lock()
+        ll := len(a.q)
+        if ll == 0 {
+            a.m.Unlock()
+            time.Sleep(10 * time.Millisecond)
+            continue
+        }
+
+        // 一次性取出所有待处理的SQL
+        queries := make([]commandData, ll)
+        copy(queries, a.q)
+        a.q = []commandData{}
+        a.m.Unlock()
+
+        // 推入 workerChan 并发执行
+        for _, q := range queries {
+            workerChan <- q
+        }
+    }
+
+    close(workerChan)
+    wg.Wait()
 }
+
