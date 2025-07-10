@@ -148,7 +148,7 @@ func (a *singleApplyer) applyLoop() {
             for cmd := range workerChan {
                 if cmd.ctype == "Q" {
                     if _, err := db.Exec(cmd.query); err != nil {
-                        fmt.Printf("[Worker %d][ERROR] mysql exec failed: %v\n", workerID, err)
+                        fmt.Printf("[Worker %d][ERROR] mysql exec failed: %v\nSQL: %s\n", workerID, err, cmd.query)
                     }
                 }
             }
