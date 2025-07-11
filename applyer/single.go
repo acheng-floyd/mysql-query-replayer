@@ -151,6 +151,8 @@ func (a *singleApplyer) applyLoop() {
             continue
         }
         dbPools[dbname] = db
+        // 新增日志：连接池创建成功
+        fmt.Printf("连接池创建成功: 数据库 %s\n", dbname) 
     }
     defer func() {
         for _, db := range dbPools {
