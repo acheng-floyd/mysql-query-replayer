@@ -55,7 +55,7 @@ func parseOptions() {
 	flag.IntVar(&mPort, "mP", 3306, "mysql port")
 	flag.StringVar(&mUser, "mu", "root", "mysql user")
 	flag.StringVar(&mPassword, "mp", "", "mysql password")
-	flag.StringVar(&mdb, "md", "", "mysql database")
+    flag.StringVar(&mdb, "md", "", "目标数据库，多个用逗号分隔")
 	flag.StringVar(&mSocket, "mS", "", "mysql unix domain socket")
 
 	// redis
