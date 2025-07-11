@@ -46,9 +46,9 @@ func (a *singleApplyer) start() {
 					fmt.Println(ips[1] + " is specified as ignoring host")
 					continue
 				}
-				if ignoreConnectionLimit || hostCnt <= a.cpuLimit {
-					a.hostProgress.Store(k, "0")
-					hostCnt += 1
+                if ignoreConnectionLimit || hostCnt <= a.cpuLimit {
+				    a.hostProgress.Store(k, "0")
+		            hostCnt += 1
 				} else {
 					fmt.Println("Too many hosts, ignore " + k)
 				}
@@ -72,6 +72,7 @@ func (a *singleApplyer) retrieveLoop() {
 				ll := len(a.q)
 				a.m.Unlock()
 				if ll > 10000 {
+					// fmt.Println("more than 1000")
 					time.Sleep(50 * time.Millisecond)
 					continue
 				}
@@ -86,8 +87,8 @@ func (a *singleApplyer) retrieveLoop() {
 			}
 			l := len(queries)
 			if l < 1 {
-				// 如果 key 已经空了，从 hostProgress 删除，不再消费
-				a.hostProgress.Delete(k)
+                // 如果 key 已经空了，从 hostProgress 删除，不再消费
+                a.hostProgress.Delete(k)
 				continue
 			}
 			r = rpool.Get()
@@ -99,21 +100,17 @@ func (a *singleApplyer) retrieveLoop() {
 
 			tmp := []commandData{}
 			for i := 0; i < l; i++ {
-				val := queries[i]
-				// 支持新格式：Q;时间戳;db;sql
-				parts := strings.SplitN(val, ";", 4)
-				if len(parts) < 4 {
-					continue // 跳过老格式
-				}
-				capturedTime, err := strconv.Atoi(parts[1])
+				// ?? need judgement of command_type
+				val := strings.SplitN(queries[i], ";", 3)
+				capturedTime, err := strconv.Atoi(val[1])
 				if err != nil {
 					fmt.Println(err)
 					continue
 				}
 				st := commandData{
-					ctype:        parts[0],
+					ctype:        val[0],
 					capturedTime: capturedTime,
-					query:        val, // 直接全量保存，worker里解析
+					query:        val[2],
 				}
 				tmp = append(tmp, st)
 			}
@@ -125,72 +122,61 @@ func (a *singleApplyer) retrieveLoop() {
 }
 
 func (a *singleApplyer) applyLoop() {
-	mysqlHost := mUser + ":" + mPassword + "@tcp(" + mHost + ":" + strconv.Itoa(mPort) + ")/" + mdb + "?loc=Local&parseTime=true"
-	if mSocket != "" {
-		mysqlHost = mUser + ":" + mPassword + "@unix(" + mSocket + ")/" + mdb + "?loc=Local&parseTime=true"
-	}
+    mysqlHost := mUser + ":" + mPassword + "@tcp(" + mHost + ":" + strconv.Itoa(mPort) + ")/" + mdb + "?loc=Local&parseTime=true"
+    if mSocket != "" {
+        mysqlHost = mUser + ":" + mPassword + "@unix(" + mSocket + ")/" + mdb + "?loc=Local&parseTime=true"
+    }
 
-	db, err := sql.Open("mysql", mysqlHost)
-	if err != nil {
-		fmt.Println("Connection to MySQL fail.", err)
-		return
-	}
-	defer db.Close()
+    db, err := sql.Open("mysql", mysqlHost)
+    if err != nil {
+        fmt.Println("Connection to MySQL fail.", err)
+        return
+    }
+    defer db.Close()
 
-	var (
-		concurrency = 64 // 可调整
-		workerChan  = make(chan commandData, 1000)
-		wg          sync.WaitGroup
-	)
+    var (
+        concurrency = 64 // 并发数，可调整
+        workerChan  = make(chan commandData, 1000)
+        wg          sync.WaitGroup
+    )
 
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			var lastDB string
-			for cmd := range workerChan {
-				if cmd.ctype == "Q" {
-					parts := strings.SplitN(cmd.query, ";", 4)
-					if len(parts) < 4 {
-						continue // 跳过不带db的老格式
-					}
-					dbName := parts[2]
-					sqlStr := parts[3]
-					if dbName != "" && dbName != lastDB {
-						_, err := db.Exec("USE " + dbName)
-						if err != nil {
-							fmt.Printf("[Worker %d][ERROR] change db to %s failed: %v\n", workerID, dbName, err)
-							continue
-						}
-						lastDB = dbName
-					}
-					if _, err := db.Exec(sqlStr); err != nil {
-						fmt.Printf("[Worker %d][ERROR] mysql exec failed: %v\nSQL: %s\n", workerID, err, sqlStr)
-					}
-				}
-			}
-		}(i)
-	}
+    // 启动多个goroutine并行执行SQL
+    for i := 0; i < concurrency; i++ {
+        wg.Add(1)
+        go func(workerID int) {
+            defer wg.Done()
+            for cmd := range workerChan {
+                if cmd.ctype == "Q" {
+                    if _, err := db.Exec(cmd.query); err != nil {
+                        fmt.Printf("[Worker %d][ERROR] mysql exec failed: %v\nSQL: %s\n", workerID, err, cmd.query)
+                    }
+                }
+            }
+        }(i)
+    }
 
-	for {
-		a.m.Lock()
-		ll := len(a.q)
-		if ll == 0 {
-			a.m.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		queries := make([]commandData, ll)
-		copy(queries, a.q)
-		a.q = []commandData{}
-		a.m.Unlock()
-		for _, q := range queries {
-			workerChan <- q
-		}
-	}
+    for {
+        a.m.Lock()
+        ll := len(a.q)
+        if ll == 0 {
+            a.m.Unlock()
+            time.Sleep(10 * time.Millisecond)
+            continue
+        }
 
-	// 下面这两行理论上执行不到，但保留更规范
-	// close(workerChan)
-	// wg.Wait()
+        // 一次性取出所有待处理的SQL
+        queries := make([]commandData, ll)
+        copy(queries, a.q)
+        a.q = []commandData{}
+        a.m.Unlock()
+
+        // 推入 workerChan 并发执行
+        for _, q := range queries {
+            workerChan <- q
+        }
+    }
+
+    close(workerChan)
+    wg.Wait()
 }
 
