@@ -129,11 +129,82 @@ func isSelectQuery(q string) bool {
     return strings.HasPrefix(strings.ToLower(q), "select")
 }
 
-func sendQuery(packet gopacket.Packet) {
+// 自动识别 handshake/login 包, 捕获数据库名
+func parseLoginDB(packet gopacket.Packet) (string, string, int, bool) {
     applicationLayer := packet.ApplicationLayer()
     if applicationLayer == nil {
+        return "", "", 0, false
+    }
+    payload := applicationLayer.Payload()
+    if len(payload) < 37 {
+        return "", "", 0, false
+    }
+    cmd := payload[4]
+    if cmd == 0x10 || cmd == 0x1d || cmd == 0x09 {
+        // 按主流MySQL协议结构
+        start := 36
+        if start >= len(payload) {
+            return "", "", 0, false
+        }
+        i := start
+        for ; i < len(payload); i++ {
+            if payload[i] == 0x00 {
+                i++
+                break
+            }
+        }
+        for ; i < len(payload); i++ {
+            if payload[i] == 0x00 {
+                i++
+                break
+            }
+        }
+        dbStart := i
+        dbEnd := i
+        for ; dbEnd < len(payload); dbEnd++ {
+            if payload[dbEnd] == 0x00 {
+                break
+            }
+        }
+        if dbEnd > dbStart && dbEnd <= len(payload) {
+            db := string(payload[dbStart:dbEnd])
+            // 源IP和端口
+            net := packet.NetworkLayer()
+            trans := packet.TransportLayer()
+            srcIP := ""
+            srcPort := 0
+            if net != nil && trans != nil {
+                srcIP = net.NetworkFlow().Src().String()
+                srcPortStr := trans.TransportFlow().Src().String()
+                if p, err := strconv.Atoi(srcPortStr); err == nil {
+                    srcPort = p
+                } else if strings.Contains(srcPortStr, ":") {
+                    parts := strings.Split(srcPortStr, ":")
+                    if len(parts) > 1 {
+                        p, _ := strconv.Atoi(parts[len(parts)-1])
+                        srcPort = p
+                    }
+                }
+            }
+            return strings.TrimSpace(db), srcIP, srcPort, true
+        }
+    }
+    return "", "", 0, false
+}
+
+func sendQuery(packet gopacket.Packet) {
+    // step1: handshake/login包自动记录db
+    if db, srcIP, srcPort, ok := parseLoginDB(packet); ok {
+        key := name + ":" + srcIP + ":" + strconv.Itoa(srcPort)
+        connDBMapLock.Lock()
+        connDBMap[key] = db
+        connDBMapLock.Unlock()
+        if debug {
+            fmt.Printf("[observer] Detected handshake/login, save DB=%s for %s\n", db, key)
+        }
         return
     }
+    // step2: 常规SQL
     pInfo, err := getMySQLPacketInfo(packet)
     if err != nil {
         return
@@ -141,20 +212,18 @@ func sendQuery(packet gopacket.Packet) {
     if isIgnoreHosts(pInfo.srcIP, ignoreHosts) {
         return
     }
-
     key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
     capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
-
     if pInfo.mysqlPacket[0].GetCommandType() == mp.COM_QUERY {
         cmd := pInfo.mysqlPacket[0].(mp.ComQuery)
         q := makeOneLine(cmd.Query)
         lowerQ := strings.ToLower(strings.TrimSpace(q))
         if strings.HasPrefix(lowerQ, "use ") && len(lowerQ) > 4 {
-            db := strings.Fields(q)[1] // 获取 use 语句后的 dbname
+            db := strings.Fields(q)[1]
             connDBMapLock.Lock()
             connDBMap[key] = db
             connDBMapLock.Unlock()
-            return // use 语句本身不入库
+            return
         }
         if !isSelectQuery(q) {
             return
@@ -207,7 +276,6 @@ func sendBatch(conn redis.Conn, cmds [][2]string) {
 func main() {
     parseOptions()
     ignoreHosts = strings.Split(ignoreHostStr, ",")
-
     cpus := runtime.NumCPU() * 2
     redisHost := rHost + ":" + strconv.Itoa(rPort)
     rpool = newPool(redisHost, cpus)
@@ -240,7 +308,6 @@ func main() {
 
     packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
     semaphore := make(chan bool, runtime.NumCPU()*2)
-
     cnt := 0
     for {
         packet, err := packetSource.NextPacket()
