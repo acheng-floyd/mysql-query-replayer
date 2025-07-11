@@ -13,6 +13,7 @@ import (
     "runtime"
     "strconv"
     "strings"
+    "sync"
     "time"
 )
 
@@ -42,6 +43,10 @@ var (
 
     rpool   *redis.Pool
     redisCmdChan = make(chan [2]string, ChannelCapacity)
+
+    // 连接追踪表
+    connDBMap     = make(map[string]string)
+    connDBMapLock sync.Mutex
 )
 
 type MySQLPacketInfo struct {
@@ -58,18 +63,14 @@ func parseOptions() {
     flag.StringVar(&pcapfile, "f", "", "pcap file. this option invalid packet capture from devices.")
     flag.IntVar(&packetCount, "c", -1, "Limit processing packets count (only enable when -debug is also specified)")
     flag.StringVar(&name, "name", "", "process name which is used as prefix of redis key")
-
     flag.StringVar(&device, "d", "en0", "device name to capture.")
     flag.IntVar(&snapshotLen, "s", 1024, "snapshot length for gopacket")
     flag.BoolVar(&promiscuous, "pr", false, "promiscuous for gopacket")
-
     flag.StringVar(&ignoreHostStr, "ih", "localhost", "ignore mysql hosts, specify only one ip address")
     flag.IntVar(&mPort, "mP", 3306, "mysql port")
-
     flag.StringVar(&rHost, "rh", "localhost", "redis host")
     flag.IntVar(&rPort, "rP", 6379, "redis port")
     flag.StringVar(&rPassword, "rp", "", "redis password")
-
     flag.Parse()
 }
 
@@ -93,14 +94,12 @@ func getMySQLPacketInfo(packet gopacket.Packet) (MySQLPacketInfo, error) {
     if applicationLayer == nil {
         return MySQLPacketInfo{}, errors.New("invalid packets")
     }
-
     frame := packet.Metadata()
     ipLayer := packet.Layer(layers.LayerTypeIPv4)
     tcpLayer := packet.Layer(layers.LayerTypeTCP)
     if ipLayer == nil || tcpLayer == nil {
         return MySQLPacketInfo{}, errors.New("Invalid_Packet")
     }
-
     ip, _ := ipLayer.(*layers.IPv4)
     tcp, _ := tcpLayer.(*layers.TCP)
     mcmd := mp.DeserializePacket(applicationLayer.Payload())
@@ -125,7 +124,6 @@ func makeOneLine(q string) string {
     return q
 }
 
-// 只允许 select 语句通过
 func isSelectQuery(q string) bool {
     q = strings.TrimSpace(q)
     return strings.HasPrefix(strings.ToLower(q), "select")
@@ -144,15 +142,27 @@ func sendQuery(packet gopacket.Packet) {
         return
     }
 
+    key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
+    capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
+
     if pInfo.mysqlPacket[0].GetCommandType() == mp.COM_QUERY {
         cmd := pInfo.mysqlPacket[0].(mp.ComQuery)
         q := makeOneLine(cmd.Query)
-        if !isSelectQuery(q) {
-            return // 非select直接丢弃
+        lowerQ := strings.ToLower(strings.TrimSpace(q))
+        if strings.HasPrefix(lowerQ, "use ") && len(lowerQ) > 4 {
+            db := strings.Fields(q)[1] // 获取 use 语句后的 dbname
+            connDBMapLock.Lock()
+            connDBMap[key] = db
+            connDBMapLock.Unlock()
+            return // use 语句本身不入库
         }
-        key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
-        capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
-        val := "Q;" + capturedTime + ";" + q
+        if !isSelectQuery(q) {
+            return
+        }
+        connDBMapLock.Lock()
+        db := connDBMap[key]
+        connDBMapLock.Unlock()
+        val := "Q;" + capturedTime + ";" + db + ";" + q
         select {
         case redisCmdChan <- [2]string{key, val}:
         default:
