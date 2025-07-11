@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bytes"
     "errors"
     "flag"
     "fmt"
@@ -131,80 +132,80 @@ func isSelectQuery(q string) bool {
 
 // 自动识别 handshake/login 包, 捕获数据库名
 func parseLoginDB(packet gopacket.Packet) (string, string, int, bool) {
-    applicationLayer := packet.ApplicationLayer()
-    if applicationLayer == nil {
-        return "", "", 0, false
-    }
-    payload := applicationLayer.Payload()
+    payload := packet.ApplicationLayer().Payload()
     if len(payload) < 37 {
         return "", "", 0, false
     }
+
+    // 只处理 handshake response（实际生产通常为0x10或0x1d）
     cmd := payload[4]
-    if cmd == 0x10 || cmd == 0x1d || cmd == 0x09 {
-        // 按主流MySQL协议结构
-        start := 36
-        if start >= len(payload) {
-            return "", "", 0, false
-        }
-        i := start
-        for ; i < len(payload); i++ {
-            if payload[i] == 0x00 {
-                i++
-                break
-            }
-        }
-        for ; i < len(payload); i++ {
-            if payload[i] == 0x00 {
-                i++
-                break
-            }
-        }
-        dbStart := i
-        dbEnd := i
-        for ; dbEnd < len(payload); dbEnd++ {
-            if payload[dbEnd] == 0x00 {
-                break
-            }
-        }
-        if dbEnd > dbStart && dbEnd <= len(payload) {
-            db := string(payload[dbStart:dbEnd])
-            // 源IP和端口
-            net := packet.NetworkLayer()
-            trans := packet.TransportLayer()
-            srcIP := ""
-            srcPort := 0
-            if net != nil && trans != nil {
-                srcIP = net.NetworkFlow().Src().String()
-                srcPortStr := trans.TransportFlow().Src().String()
-                if p, err := strconv.Atoi(srcPortStr); err == nil {
-                    srcPort = p
-                } else if strings.Contains(srcPortStr, ":") {
-                    parts := strings.Split(srcPortStr, ":")
-                    if len(parts) > 1 {
-                        p, _ := strconv.Atoi(parts[len(parts)-1])
-                        srcPort = p
-                    }
-                }
-            }
-            return strings.TrimSpace(db), srcIP, srcPort, true
-        }
+    if !(cmd == 0x10 || cmd == 0x1d || cmd == 0x09) {
+        return "", "", 0, false
     }
-    return "", "", 0, false
+
+    pos := 36
+    if pos >= len(payload) {
+        return "", "", 0, false
+    }
+
+    // 获取username
+    usernameEnd := bytes.IndexByte(payload[pos:], 0x00)
+    if usernameEnd == -1 {
+        return "", "", 0, false
+    }
+    pos += usernameEnd + 1
+
+    // 获取auth-response长度 (len-encoded string)
+    if pos >= len(payload) {
+        return "", "", 0, false
+    }
+    authRespLen := int(payload[pos])
+    pos++
+
+    pos += authRespLen
+    if pos >= len(payload) {
+        return "", "", 0, false
+    }
+
+    // 获取 database (null-terminated)
+    dbEnd := bytes.IndexByte(payload[pos:], 0x00)
+    if dbEnd == -1 {
+        return "", "", 0, false
+    }
+    db := string(payload[pos : pos+dbEnd])
+
+    // IP & Port
+    net := packet.NetworkLayer()
+    trans := packet.TransportLayer()
+    srcIP, srcPort := "", 0
+    if net != nil && trans != nil {
+        srcIP = net.NetworkFlow().Src().String()
+        srcPortStr := trans.TransportFlow().Src().String()
+        srcPort, _ = strconv.Atoi(srcPortStr)
+    }
+
+    // 明确日志，确定拿到数据库
+    fmt.Printf("[HandshakeDB] IP: %s, Port: %d, Database: %s\n", srcIP, srcPort, db)
+
+    return db, srcIP, srcPort, true
 }
 
 func sendQuery(packet gopacket.Packet) {
-    // step1: handshake/login包自动记录db
+    applicationLayer := packet.ApplicationLayer()
+    if applicationLayer == nil {
+        return
+    }
+
+    // 优先处理 handshake
     if db, srcIP, srcPort, ok := parseLoginDB(packet); ok {
         key := name + ":" + srcIP + ":" + strconv.Itoa(srcPort)
         connDBMapLock.Lock()
         connDBMap[key] = db
         connDBMapLock.Unlock()
-        if debug {
-            fmt.Printf("[observer] Detected handshake/login, save DB=%s for %s\n", db, key)
-        }
         return
     }
-    // step2: 常规SQL
+
+    // 后续常规SQL处理
     pInfo, err := getMySQLPacketInfo(packet)
     if err != nil {
         return
@@ -212,8 +213,10 @@ func sendQuery(packet gopacket.Packet) {
     if isIgnoreHosts(pInfo.srcIP, ignoreHosts) {
         return
     }
+
     key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
     capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
+
     if pInfo.mysqlPacket[0].GetCommandType() == mp.COM_QUERY {
         cmd := pInfo.mysqlPacket[0].(mp.ComQuery)
         q := makeOneLine(cmd.Query)
@@ -229,13 +232,18 @@ func sendQuery(packet gopacket.Packet) {
             return
         }
         connDBMapLock.Lock()
-        db := connDBMap[key]
+        db, ok := connDBMap[key]
         connDBMapLock.Unlock()
+
+        if !ok || db == "" {
+            fmt.Printf("[Warning] No DB found for conn: %s, SQL: %s\n", key, q)
+        }
+
         val := "Q;" + capturedTime + ";" + db + ";" + q
         select {
         case redisCmdChan <- [2]string{key, val}:
         default:
-            fmt.Println("[Warning] Redis command channel is full, dropping query")
+            fmt.Println("[Warning] Redis channel full, dropping query")
         }
     }
 }
