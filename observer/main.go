@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bytes"
     "errors"
     "flag"
     "fmt"
@@ -45,8 +44,7 @@ var (
     rpool   *redis.Pool
     redisCmdChan = make(chan [2]string, ChannelCapacity)
 
-    // 连接追踪表
-    connDBMap     = make(map[string]string)
+    connDBMap     = make(map[string]string) // 连接对应的数据库名
     connDBMapLock sync.Mutex
 )
 
@@ -130,76 +128,76 @@ func isSelectQuery(q string) bool {
     return strings.HasPrefix(strings.ToLower(q), "select")
 }
 
-// 简单的handshake response DB提取 (更健壮的可用go-mysql代码逻辑模仿)
-func parseHandshakeLoginDB(packet gopacket.Packet) (string, string, int, bool) {
-    app := packet.ApplicationLayer()
-    if app == nil {
-        return "", "", 0, false
+// 解析mysql handshake response包中 dbname（标准mysql协议）
+func parseHandshakeDB(payload []byte) (string, bool) {
+    // MySQL handshake response packet格式，db在末尾，0x00结尾，前面auth-data和用户名也都是0x00分隔
+    // 具体格式详见：https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse
+    if len(payload) < 36+4 { // 至少要有基本长度
+        return "", false
     }
-    payload := app.Payload()
-    // MySQL客户端 handshake response payload 至少前36字节固定
-    if len(payload) < 36 {
-        return "", "", 0, false
+    // 协议特征字节（mysql官方说明4.1+协议），client capability flag
+    capability := int(payload[0]) | int(payload[1])<<8 | int(payload[2])<<16 | int(payload[3])<<24
+    hasDB := capability&0x08 > 0 // CLIENT_CONNECT_WITH_DB flag
+    if !hasDB {
+        return "", false
     }
-    // only process command [0x10, 0x09, 0x1d]
-    if !(payload[4] == 0x10 || payload[4] == 0x09 || payload[4] == 0x1d) {
-        return "", "", 0, false
+    // username部分
+    pos := 36 // 跳过header
+    for pos < len(payload) && payload[pos] != 0x00 {
+        pos++
     }
-    pos := 36
-    // username 结尾
-    usernameEnd := bytes.IndexByte(payload[pos:], 0x00)
-    if usernameEnd == -1 {
-        return "", "", 0, false
-    }
-    pos += usernameEnd + 1
+    pos++ // skip username \0
+    // password部分
     if pos >= len(payload) {
-        return "", "", 0, false
+        return "", false
     }
-    // auth response 是len-enc字符串
-    authLen := int(payload[pos])
-    pos += 1
-    if pos+authLen > len(payload) {
-        return "", "", 0, false
-    }
-    pos += authLen
+    authlen := int(payload[pos])
+    pos++
+    pos += authlen // skip auth-data
     if pos >= len(payload) {
-        return "", "", 0, false
+        return "", false
     }
-    // 现在是db name
-    dbEnd := bytes.IndexByte(payload[pos:], 0x00)
-    if dbEnd == -1 {
-        return "", "", 0, false
+    // dbname是下一个null结尾字符串
+    dbStart := pos
+    for pos < len(payload) && payload[pos] != 0x00 {
+        pos++
     }
-    db := string(payload[pos : pos+dbEnd])
-    net := packet.NetworkLayer()
-    trans := packet.TransportLayer()
-    srcIP, srcPort := "", 0
-    if net != nil && trans != nil {
-        srcIP = net.NetworkFlow().Src().String()
-        srcPortStr := trans.TransportFlow().Src().String()
-        srcPort, _ = strconv.Atoi(srcPortStr)
+    if pos > dbStart {
+        db := string(payload[dbStart:pos])
+        return db, true
     }
-    if db != "" {
-        fmt.Printf("[HandshakeDB] IP: %s, Port: %d, Database: %s\n", srcIP, srcPort, db)
-        return db, srcIP, srcPort, true
-    }
-    return "", "", 0, false
+    return "", false
 }
 
 func sendQuery(packet gopacket.Packet) {
-    app := packet.ApplicationLayer()
-    if app == nil {
+    applicationLayer := packet.ApplicationLayer()
+    if applicationLayer == nil {
         return
     }
-    // handshake response 检查
-    if db, srcIP, srcPort, ok := parseHandshakeLoginDB(packet); ok {
-        key := name + ":" + srcIP + ":" + strconv.Itoa(srcPort)
-        connDBMapLock.Lock()
-        connDBMap[key] = db
-        connDBMapLock.Unlock()
+
+    // handshake response包判定（MySQL客户端首次连接后发送的包）
+    payload := applicationLayer.Payload()
+    if len(payload) > 40 && (payload[4] == 0x01 || payload[4] == 0x10 || payload[4] == 0x09 || payload[4] == 0x13) {
+        db, ok := parseHandshakeDB(payload[4:])
+        if ok && db != "" {
+            net := packet.NetworkLayer()
+            trans := packet.TransportLayer()
+            srcIP, srcPort := "", 0
+            if net != nil && trans != nil {
+                srcIP = net.NetworkFlow().Src().String()
+                srcPortStr := trans.TransportFlow().Src().String()
+                srcPort, _ = strconv.Atoi(srcPortStr)
+            }
+            key := name + ":" + srcIP + ":" + strconv.Itoa(srcPort)
+            connDBMapLock.Lock()
+            connDBMap[key] = db
+            connDBMapLock.Unlock()
+            fmt.Printf("[HandshakeDB] %s:%d  Database: %s\n", srcIP, srcPort, db)
+        }
         return
     }
-    // 常规 SQL 解析
+
+    // 其余包，尝试按sql解包
     pInfo, err := getMySQLPacketInfo(packet)
     if err != nil {
         return
@@ -207,8 +205,10 @@ func sendQuery(packet gopacket.Packet) {
     if isIgnoreHosts(pInfo.srcIP, ignoreHosts) {
         return
     }
+
     key := name + ":" + pInfo.srcIP + ":" + strconv.Itoa(pInfo.srcPort)
     capturedTime := strconv.Itoa(int(pInfo.capturedTime.UnixNano() / 1000))
+
     if pInfo.mysqlPacket[0].GetCommandType() == mp.COM_QUERY {
         cmd := pInfo.mysqlPacket[0].(mp.ComQuery)
         q := makeOneLine(cmd.Query)
@@ -218,17 +218,20 @@ func sendQuery(packet gopacket.Packet) {
             connDBMapLock.Lock()
             connDBMap[key] = db
             connDBMapLock.Unlock()
+            fmt.Printf("[USE DB] %s update db: %s\n", key, db)
             return
         }
         if !isSelectQuery(q) {
             return
         }
         connDBMapLock.Lock()
-        db, ok := connDBMap[key]
+        db := connDBMap[key]
         connDBMapLock.Unlock()
-        if !ok || db == "" {
+
+        if db == "" {
             fmt.Printf("[Warning] No DB found for conn: %s, SQL: %s\n", key, q)
         }
+
         val := "Q;" + capturedTime + ";" + db + ";" + q
         select {
         case redisCmdChan <- [2]string{key, val}:
